@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QWidgetAction
 )
-from PyQt5.QtGui import QColor, QPainter, QIcon, QPalette
+from PyQt5.QtGui import QColor, QPainter, QIcon, QPalette, QPixmap
 from PyQt5.QtCore import Qt, QRect, QSize
 # Import the QGIS color wheel widget
 from qgis.gui import QgsColorWheel
@@ -358,9 +358,12 @@ class LayerColorDelegate(QStyledItemDelegate):
         """
         Custom painting of each layer tree item, including setting a background color
         based on the node's highlight color and drawing an icon if the node represents a layer.
+        Now also inverts the icon colors when the background is dark.
         """
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+
+        invert_icon = False  # Flag to decide if the icon should be inverted
 
         # Get the node corresponding to the current index
         node = self.layer_color_plugin.layer_tree_view.index2node(index)
@@ -386,16 +389,20 @@ class LayerColorDelegate(QStyledItemDelegate):
                     darker = min(lum1, lum2)
                     return (lighter + 0.05) / (darker + 0.05)
 
-                # Calculate contrast ratios for black and white text against the background
                 ratio_black = contrast_ratio(bg, QColor(0, 0, 0))
                 ratio_white = contrast_ratio(bg, QColor(255, 255, 255))
                 # Choose text color based on WCAG guidelines
-                if ratio_black < 4.5:
-                    if ratio_white >= 4.5:
-                        chosen_text_color = QColor(255, 255, 255)
-                    else:
-                        chosen_text_color = QColor(0, 0, 0) if ratio_black >= ratio_white else QColor(255, 255, 255)
-                    opt.palette.setColor(QPalette.Text, chosen_text_color)
+                if ratio_black >= 4.5 and ratio_black >= ratio_white:
+                    chosen_text_color = QColor(0, 0, 0)
+                elif ratio_white >= 4.5:
+                    chosen_text_color = QColor(255, 255, 255)
+                else:
+                    chosen_text_color = QColor(0, 0, 0) if ratio_black >= ratio_white else QColor(255, 255, 255)
+                opt.palette.setColor(QPalette.Text, chosen_text_color)
+
+                # If white text is chosen, assume the background is dark and set the flag to invert the icon.
+                if chosen_text_color == QColor(255, 255, 255):
+                    invert_icon = True
 
         style = option.widget.style() if option.widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, option.widget)
@@ -423,4 +430,12 @@ class LayerColorDelegate(QStyledItemDelegate):
                     icon_size.width(),
                     icon_size.height()
                 )
-                icon_to_draw.paint(painter, icon_rect, Qt.AlignCenter)
+                if invert_icon:
+                    # Create a pixmap from the icon and invert its colors
+                    pixmap = icon_to_draw.pixmap(icon_size)
+                    image = pixmap.toImage()
+                    image.invertPixels()  # Inverts all the pixels
+                    inverted_pixmap = QPixmap.fromImage(image)
+                    painter.drawPixmap(icon_rect, inverted_pixmap)
+                else:
+                    icon_to_draw.paint(painter, icon_rect, Qt.AlignCenter)
