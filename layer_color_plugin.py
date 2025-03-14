@@ -413,7 +413,7 @@ class LayerColorDelegate(QStyledItemDelegate):
             icon_to_draw = None
             if layer is None or not layer.isValid():
                 icon_to_draw = self.default_missing_icon
-            elif not layer.crs().isValid():
+            elif not layer.crs().isValid() and layer.isSpatial():
                 icon_to_draw = self.default_nocrs_icon
             elif layer.dataProvider().name() == "memory":
                 icon_to_draw = self.default_memory_icon
