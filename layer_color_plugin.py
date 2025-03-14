@@ -8,11 +8,11 @@ from PyQt5.QtWidgets import (
     QStyle,
     QApplication,
     QMessageBox,
-    QWidgetAction
+    QWidgetAction,
+    QColorDialog  
 )
 from PyQt5.QtGui import QColor, QPainter, QIcon, QPalette, QPixmap
 from PyQt5.QtCore import Qt, QRect, QSize
-# Import the QGIS color wheel widget
 from qgis.gui import QgsColorWheel
 
 def log_message(message):
@@ -102,6 +102,7 @@ class LayerColorPlugin:
         """
         Displays the context menu when a user right-clicks in the layer tree view.
         Embeds a color wheel (qgis.gui.QgsColorWheel) with proper lifetime management.
+        Also adds an option to open a color picker dialog for an exact color.
         """
         # Temporarily disconnect the signal to avoid recursive calls
         self.layer_tree_view.customContextMenuRequested.disconnect(self.show_context_menu)
@@ -116,6 +117,11 @@ class LayerColorPlugin:
 
         # Create a submenu for layer highlight color actions
         highlight_menu = QMenu("Layer Highlight Color", context_menu)
+
+        # *** New: Add "Pick Exact Color" option at the top ***
+        exact_color_action = QAction("Pick Exact Color...", highlight_menu)
+        exact_color_action.triggered.connect(lambda: self.open_color_picker_dialog())
+        highlight_menu.addAction(exact_color_action)
 
         # Create an embedded color wheel using QgsColorWheel from QGIS GUI.
         color_wheel = QgsColorWheel(context_menu)
@@ -170,9 +176,29 @@ class LayerColorPlugin:
         # Execute the context menu at the global position corresponding to the click point
         context_menu.exec_(self.layer_tree_view.mapToGlobal(point))
 
+    def open_color_picker_dialog(self):
+        """
+        Opens a modal color picker dialog for the user to select an exact color.
+        The selected color is applied to all selected nodes.
+        """
+        selected_nodes = self.layer_tree_view.selectedNodes()
+        initial_color = None
+        if selected_nodes:
+            current_color = selected_nodes[0].customProperty("highlight_color", None)
+            if current_color:
+                initial_color = QColor(current_color)
+        # Create the color picker dialog; parent it to the layer tree view
+        dialog = QColorDialog(initial_color if initial_color else QColor(), self.layer_tree_view)
+        dialog.setOption(QColorDialog.ShowAlphaChannel, False)
+        # Execute the dialog modally
+        if dialog.exec_():
+            color = dialog.selectedColor()
+            if color.isValid():
+                self.set_layer_color_from_widget(color)
+
     def set_layer_color_from_widget(self, color):
         """
-        Called when the user changes the color in the embedded color wheel.
+        Called when the user changes the color in the embedded color wheel or via the color picker.
         Updates all selected nodes with the new highlight color.
         """
         selected_nodes = self.layer_tree_view.selectedNodes()
