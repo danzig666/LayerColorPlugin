@@ -411,7 +411,7 @@ class LayerColorDelegate(QStyledItemDelegate):
         if node and QgsLayerTree.isLayer(node):
             layer = node.layer()
             icon_to_draw = None
-            if not layer.isValid():
+            if layer is None or not layer.isValid():
                 icon_to_draw = self.default_missing_icon
             elif not layer.crs().isValid():
                 icon_to_draw = self.default_nocrs_icon
