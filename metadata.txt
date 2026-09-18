@@ -7,7 +7,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=This plugin enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. 
 about=It streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers or groups through custom background colors. This plugin adds a menu called "Layer Highlight Color", located above the "Properties" in the "Layer Properties" menu. Always choose pastel or lighter colors. The code implements "WCAG 2.0" contrast ratio checking to avoid colors that can make hard to read the layer text. 
-version=0.6
+version=0.7
 
 homepage=https://github.com/danzig666/LayerColorPlugin
 tracker=https://github.com/danzig666/LayerColorPlugin/issues
@@ -17,6 +17,11 @@ deprecated=False
 icon=icon.png
 
 changelog=
+
+ Version 0.7:
+ * Disabling/reloading the plugin no longer deletes highlight colors from the open project.
+ * On unload, QGIS's original layer tree delegate (layer indicator icons) and right-click menu are restored.
+ * Context menu insertion skips null/invalid actions (QGIS 4 / Qt6 robustness).
 
  Version 0.6:
  * Qt6 / QGIS 4 compatibility: imports via qgis.PyQt, fully scoped enums, exec() instead of exec_(), QAction import for Qt5 and Qt6.

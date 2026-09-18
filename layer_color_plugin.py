@@ -45,6 +45,10 @@ class LayerColorPlugin:
             if not self.layer_tree_view:
                 raise Exception("Layer Tree View not available")
 
+            # Remember QGIS's own delegate and context menu policy so unload() can restore them
+            self.original_delegate = self.layer_tree_view.itemDelegate()
+            self.original_context_menu_policy = self.layer_tree_view.contextMenuPolicy()
+
             # Set a custom delegate to handle item drawing
             self.delegate = LayerColorDelegate(self, self.layer_tree_view)
             self.layer_tree_view.setItemDelegate(self.delegate)
@@ -66,41 +70,38 @@ class LayerColorPlugin:
 
     def unload(self):
         """
-        Unloads the plugin by disconnecting signals and restoring the default delegate.
-        Also clears any custom highlight color properties.
+        Unloads the plugin by disconnecting signals and restoring QGIS's original
+        delegate and context menu policy. Highlight colors are kept on the nodes
+        so they are not lost if the project is saved while the plugin is disabled.
+        Each step runs independently so one failure does not skip the others.
         """
-        try:
-            # Disconnect the custom context menu signal
-            if hasattr(self, "layer_tree_view"):
-                self.layer_tree_view.customContextMenuRequested.disconnect(self.show_context_menu)
+        def attempt(step, func):
+            try:
+                func()
+            except Exception as e:
+                log_message(f"Error during unload ({step}): {str(e)}")
 
-            # Restore the original delegate
-            if hasattr(self, "delegate") and self.delegate is not None:
-                original_delegate = QStyledItemDelegate(self.layer_tree_view)
-                self.layer_tree_view.setItemDelegate(original_delegate)
+        view = getattr(self, "layer_tree_view", None)
+        if view is not None:
+            attempt("context menu signal",
+                    lambda: view.customContextMenuRequested.disconnect(self.show_context_menu))
+
+            original_policy = getattr(self, "original_context_menu_policy", None)
+            if original_policy is not None:
+                attempt("context menu policy", lambda: view.setContextMenuPolicy(original_policy))
+
+            if getattr(self, "delegate", None) is not None:
+                original_delegate = getattr(self, "original_delegate", None)
+                attempt("delegate", lambda: view.setItemDelegate(
+                    original_delegate if original_delegate is not None else QStyledItemDelegate(view)))
+                self.delegate.deleteLater()
                 self.delegate = None
 
-            # Clear custom highlight_color properties from all nodes
-            root = self.iface.layerTreeView().layerTreeModel().rootGroup()
+        attempt("writeProject signal", lambda: QgsProject.instance().writeProject.disconnect(self.save_colors))
+        attempt("projectRead signal", lambda: self.iface.projectRead.disconnect(self.load_colors))
 
-            def clear_custom_color(node):
-                if hasattr(node, "customProperty") and node.customProperty("highlight_color", None):
-                    node.removeCustomProperty("highlight_color")
-                for child in node.children():
-                    clear_custom_color(child)
-
-            clear_custom_color(root)
-
-            # Disconnect the project signals
-            QgsProject.instance().writeProject.disconnect(self.save_colors)
-            self.iface.projectRead.disconnect(self.load_colors)
-
-            # Refresh the layer tree view
-            if hasattr(self, "layer_tree_view"):
-                self.layer_tree_view.viewport().update()
-
-        except Exception as e:
-            log_message(f"Error during unload: {str(e)}")
+        if view is not None:
+            attempt("refresh", lambda: view.viewport().update())
 
     def show_context_menu(self, point):
         """
@@ -155,11 +156,21 @@ class LayerColorPlugin:
         paste_color_action.triggered.connect(lambda: self.handle_paste_color(context_menu))
         highlight_menu.addAction(paste_color_action)
 
-        # Insert the custom highlight menu into the context menu
-        actions = context_menu.actions()
-        if actions:
-            context_menu.insertMenu(actions[-1], highlight_menu)
-        else:
+        # Insert the custom highlight menu before the last valid action (normally "Properties...").
+        # In QGIS 4 / Qt6 the default context menu may contain null or invalid QAction entries;
+        # inserting before one of those can trigger warnings or instability, so skip them.
+        inserted = False
+        for action in reversed(context_menu.actions()):
+            if action is None:
+                continue
+            try:
+                if action.text():
+                    context_menu.insertMenu(action, highlight_menu)
+                    inserted = True
+                    break
+            except RuntimeError:
+                continue
+        if not inserted:
             context_menu.addMenu(highlight_menu)
 
         # Define a cleanup function to disconnect and delete the color wheel widget
