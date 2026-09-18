@@ -1,25 +1,29 @@
 import os
 from qgis.core import QgsMessageLog, Qgis, QgsProject, QgsLayerTree
-from PyQt5.QtWidgets import (
-    QAction,
+from qgis.PyQt.QtWidgets import (
     QMenu,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
     QApplication,
-    QMessageBox,
     QWidgetAction,
-    QColorDialog  
+    QColorDialog
 )
-from PyQt5.QtGui import QColor, QPainter, QIcon, QPalette, QPixmap
-from PyQt5.QtCore import Qt, QRect, QSize
+from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPalette, QPixmap
+from qgis.PyQt.QtCore import Qt, QRect, QSize
+
+# QAction lives in QtWidgets on Qt5 and in QtGui on Qt6
+try:
+    from qgis.PyQt.QtGui import QAction
+except ImportError:
+    from qgis.PyQt.QtWidgets import QAction
 from qgis.gui import QgsColorWheel
 
 def log_message(message):
     """
     Logs messages to QGIS log panel and Python console.
     """
-    QgsMessageLog.logMessage(message, "LayerColorPlugin", Qgis.Info)
+    QgsMessageLog.logMessage(message, "LayerColorPlugin", Qgis.MessageLevel.Info)
     print(message)
 
 
@@ -46,7 +50,7 @@ class LayerColorPlugin:
             self.layer_tree_view.setItemDelegate(self.delegate)
 
             # Set up a custom context menu on the layer tree view
-            self.layer_tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.layer_tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.layer_tree_view.customContextMenuRequested.connect(self.show_context_menu)
 
             # Connect project signals to save and load custom colors
@@ -174,7 +178,7 @@ class LayerColorPlugin:
         context_menu.aboutToHide.connect(cleanup)
 
         # Execute the context menu at the global position corresponding to the click point
-        context_menu.exec_(self.layer_tree_view.mapToGlobal(point))
+        context_menu.exec(self.layer_tree_view.mapToGlobal(point))
 
     def open_color_picker_dialog(self):
         """
@@ -189,9 +193,9 @@ class LayerColorPlugin:
                 initial_color = QColor(current_color)
         # Create the color picker dialog; parent it to the layer tree view
         dialog = QColorDialog(initial_color if initial_color else QColor(), self.layer_tree_view)
-        dialog.setOption(QColorDialog.ShowAlphaChannel, False)
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, False)
         # Execute the dialog modally
-        if dialog.exec_():
+        if dialog.exec():
             color = dialog.selectedColor()
             if color.isValid():
                 self.set_layer_color_from_widget(color)
@@ -397,7 +401,7 @@ class LayerColorDelegate(QStyledItemDelegate):
             color = node.customProperty('highlight_color', None)
             if color:
                 bg = QColor(color)
-                opt.backgroundBrush = bg
+                opt.backgroundBrush = QBrush(bg)
 
                 # Helper function to compute the luminance of a color
                 def get_luminance(c):
@@ -424,14 +428,14 @@ class LayerColorDelegate(QStyledItemDelegate):
                     chosen_text_color = QColor(255, 255, 255)
                 else:
                     chosen_text_color = QColor(0, 0, 0) if ratio_black >= ratio_white else QColor(255, 255, 255)
-                opt.palette.setColor(QPalette.Text, chosen_text_color)
+                opt.palette.setColor(QPalette.ColorRole.Text, chosen_text_color)
 
                 # If white text is chosen, assume the background is dark and set the flag to invert the icon.
                 if chosen_text_color == QColor(255, 255, 255):
                     invert_icon = True
 
         style = option.widget.style() if option.widget else QApplication.style()
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, option.widget)
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
 
         # If the node represents a layer, draw its corresponding icon on the right
         if node and QgsLayerTree.isLayer(node):
@@ -441,10 +445,13 @@ class LayerColorDelegate(QStyledItemDelegate):
                 icon_to_draw = self.default_missing_icon
             elif not layer.crs().isValid() and layer.isSpatial():
                 icon_to_draw = self.default_nocrs_icon
-            elif layer.dataProvider().name() == "memory":
-                icon_to_draw = self.default_memory_icon
-            elif layer.dataProvider().name() == "virtual":
-                icon_to_draw = self.default_virtual_icon
+            else:
+                provider = layer.dataProvider()
+                provider_name = provider.name() if provider else ""
+                if provider_name == "memory":
+                    icon_to_draw = self.default_memory_icon
+                elif provider_name == "virtual":
+                    icon_to_draw = self.default_virtual_icon
 
             if icon_to_draw and not icon_to_draw.isNull():
                 available_width = (option.widget.viewport().width() if option.widget else opt.rect.width())
@@ -464,4 +471,4 @@ class LayerColorDelegate(QStyledItemDelegate):
                     inverted_pixmap = QPixmap.fromImage(image)
                     painter.drawPixmap(icon_rect, inverted_pixmap)
                 else:
-                    icon_to_draw.paint(painter, icon_rect, Qt.AlignCenter)
+                    icon_to_draw.paint(painter, icon_rect, Qt.AlignmentFlag.AlignCenter)
