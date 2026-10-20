@@ -9,8 +9,17 @@ from qgis.PyQt.QtWidgets import (
     QWidgetAction,
     QColorDialog
 )
-from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPalette, QPixmap
-from qgis.PyQt.QtCore import Qt, QRect, QSize
+from qgis.PyQt.QtGui import QBrush, QColor, QFontMetrics, QIcon, QPalette, QPixmap
+from qgis.PyQt.QtCore import (
+    Qt,
+    QEvent,
+    QModelIndex,
+    QObject,
+    QRect,
+    QSettings,
+    QSize,
+    QTimer,
+)
 
 # QAction lives in QtWidgets on Qt5 and in QtGui on Qt6
 try:
@@ -18,6 +27,32 @@ try:
 except ImportError:
     from qgis.PyQt.QtWidgets import QAction
 from qgis.gui import QgsColorWheel
+
+# QSettings key for the "wrap long names" toggle
+WRAP_SETTING_KEY = "LayerColorPlugin/wrap_long_names"
+
+# Title of the plugin's entry under the QGIS "Plugins" menu
+PLUGIN_MENU_TITLE = "&Layer Color Plugin"
+
+# Label used for the wrap toggle, in both the Plugins menu and the context menu
+WRAP_ACTION_LABEL = "Wrap Long Layer Names"
+
+# Characters that long layer names are usually built from. A zero-width space is
+# inserted after each one when wrapping, so lines break at these rather than at
+# an arbitrary letter.
+WRAP_BREAK_CHARS = "_-./\\"
+
+# Text flags used when wrapping names. Plain word wrapping is used together with
+# the zero-width breaks inserted by _breakable(), so a name breaks at its own
+# separators ("ovezeti_" / "jel_" / "terv_" / "feliratok"). TextWrapAnywhere is
+# deliberately not used here: it breaks at an arbitrary letter even when a
+# separator is available, which would leave orphans like "felirato" / "k".
+WRAP_TEXT_FLAGS = Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft
+
+# Fallback for a name with no separators at all, which word wrapping alone
+# cannot break. Used only when a line would otherwise overflow the panel.
+WRAP_TEXT_FLAGS_ANYWHERE = WRAP_TEXT_FLAGS | Qt.TextFlag.TextWrapAnywhere
+
 
 def log_message(message):
     """
@@ -53,6 +88,26 @@ class LayerColorPlugin:
             self.delegate = LayerColorDelegate(self, self.layer_tree_view)
             self.layer_tree_view.setItemDelegate(self.delegate)
 
+            # Re-wrap names when the panel is resized. The view does not
+            # recompute row heights on its own, so a resize schedules a refresh.
+            self.rewrap_timer = QTimer()
+            self.rewrap_timer.setSingleShot(True)
+            self.rewrap_timer.setInterval(60)
+            self.rewrap_timer.timeout.connect(self.refresh_row_heights)
+            self.resize_filter = ViewportResizeFilter(self.rewrap_timer, self.layer_tree_view)
+            self.layer_tree_view.viewport().installEventFilter(self.resize_filter)
+
+            # Add the wrap toggle to the QGIS "Plugins" menu, so the setting can
+            # be found without opening the layer tree context menu
+            self.wrap_action = QAction(WRAP_ACTION_LABEL, self.iface.mainWindow())
+            self.wrap_action.setCheckable(True)
+            self.wrap_action.setChecked(bool(self.delegate.wrap_enabled))
+            self.wrap_action.setStatusTip(
+                "Wrap long layer, group and symbology names over several lines"
+            )
+            self.wrap_action.toggled.connect(self.toggle_wrap_names)
+            self.iface.addPluginToMenu(PLUGIN_MENU_TITLE, self.wrap_action)
+
             # Set up a custom context menu on the layer tree view
             self.layer_tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.layer_tree_view.customContextMenuRequested.connect(self.show_context_menu)
@@ -81,10 +136,23 @@ class LayerColorPlugin:
             except Exception as e:
                 log_message(f"Error during unload ({step}): {str(e)}")
 
+        if getattr(self, "wrap_action", None) is not None:
+            attempt("plugins menu entry",
+                    lambda: self.iface.removePluginMenu(PLUGIN_MENU_TITLE, self.wrap_action))
+            self.wrap_action = None
+
         view = getattr(self, "layer_tree_view", None)
         if view is not None:
             attempt("context menu signal",
                     lambda: view.customContextMenuRequested.disconnect(self.show_context_menu))
+
+            if getattr(self, "resize_filter", None) is not None:
+                attempt("resize filter", lambda: view.viewport().removeEventFilter(self.resize_filter))
+                self.resize_filter = None
+
+        if getattr(self, "rewrap_timer", None) is not None:
+            attempt("rewrap timer", self.rewrap_timer.stop)
+            self.rewrap_timer = None
 
             original_policy = getattr(self, "original_context_menu_policy", None)
             if original_policy is not None:
@@ -102,6 +170,74 @@ class LayerColorPlugin:
 
         if view is not None:
             attempt("refresh", lambda: view.viewport().update())
+
+    # ------------------------------------------------------------ name wrapping
+
+    def visible_indexes(self):
+        """
+        Returns the indexes of all currently visible rows (expanded branches
+        only), which is what needs new row heights after a re-wrap.
+        """
+        view = self.layer_tree_view
+        model = view.model()
+        found = []
+        if model is None:
+            return found
+
+        def walk(parent):
+            for row in range(model.rowCount(parent)):
+                index = model.index(row, 0, parent)
+                found.append(index)
+                if view.isExpanded(index):
+                    walk(index)
+
+        walk(QModelIndex())
+        return found
+
+    def refresh_row_heights(self):
+        """
+        Tells the view that row heights may have changed. QTreeView caches them,
+        so re-wrapping needs sizeHintChanged for each visible row.
+        """
+        try:
+            delegate = getattr(self, "delegate", None)
+            if delegate is None:
+                return
+            for index in self.visible_indexes():
+                delegate.sizeHintChanged.emit(index)
+            self.layer_tree_view.viewport().update()
+        except Exception as e:
+            log_message(f"Error refreshing row heights: {str(e)}")
+
+    def toggle_wrap_names(self, enabled):
+        """
+        Turns name wrapping on or off and remembers the choice.
+        """
+        try:
+            delegate = getattr(self, "delegate", None)
+            if delegate is None:
+                return
+            enabled = bool(enabled)
+            delegate.wrap_enabled = enabled
+
+            # Keep the Plugins menu entry in step when toggled from the layer
+            # tree context menu. Signals are blocked so setChecked() does not
+            # call straight back into this method.
+            action = getattr(self, "wrap_action", None)
+            if action is not None and action.isChecked() != enabled:
+                blocked = action.blockSignals(True)
+                action.setChecked(enabled)
+                action.blockSignals(blocked)
+
+            settings = QSettings()
+            settings.setValue(WRAP_SETTING_KEY, bool(enabled))
+            # Flush now: on Windows QSettings writes to the registry and keeps
+            # them cached, so without this the choice can be lost on a crash.
+            settings.sync()
+            self.refresh_row_heights()
+            log_message(f"Wrap long names: {'on' if enabled else 'off'}")
+        except Exception as e:
+            log_message(f"Error toggling name wrapping: {str(e)}")
 
     def show_context_menu(self, point):
         """
@@ -155,6 +291,14 @@ class LayerColorPlugin:
         paste_color_action = QAction("Paste Highlight Color", highlight_menu)
         paste_color_action.triggered.connect(lambda: self.handle_paste_color(context_menu))
         highlight_menu.addAction(paste_color_action)
+
+        # Toggle for wrapping long layer/group names over several lines
+        highlight_menu.addSeparator()
+        wrap_action = QAction(WRAP_ACTION_LABEL, highlight_menu)
+        wrap_action.setCheckable(True)
+        wrap_action.setChecked(bool(getattr(self.delegate, "wrap_enabled", False)))
+        wrap_action.toggled.connect(self.toggle_wrap_names)
+        highlight_menu.addAction(wrap_action)
 
         # Insert the custom highlight menu before the last valid action (normally "Properties...").
         # In QGIS 4 / Qt6 the default context menu may contain null or invalid QAction entries;
@@ -370,6 +514,33 @@ class LayerColorPlugin:
             log_message(f"Error loading colors: {str(e)}")
 
 
+class ViewportResizeFilter(QObject):
+    """
+    Watches the layer tree viewport for resizes and schedules a re-wrap.
+
+    Exceptions are swallowed on purpose: an exception escaping a Python event
+    filter can propagate into Qt and, on Qt6, take QGIS down with it.
+    """
+
+    def __init__(self, timer, parent=None):
+        super().__init__(parent)
+        self.timer = timer
+        self.last_width = None
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Type.Resize:
+                width = event.size().width()
+                # Only react to width changes; height changes cannot re-wrap
+                if width != self.last_width:
+                    self.last_width = width
+                    if self.timer is not None:
+                        self.timer.start()
+        except Exception as e:
+            log_message(f"Error in viewport resize filter: {str(e)}")
+        return False
+
+
 class LayerColorDelegate(QStyledItemDelegate):
     def __init__(self, layer_colors, parent=None):
         """
@@ -385,15 +556,143 @@ class LayerColorDelegate(QStyledItemDelegate):
         self.default_missing_icon = QIcon(os.path.join(icons_dir, "mIndicatorBadLayer.svg"))
         self.default_nocrs_icon = QIcon(os.path.join(icons_dir, "mIndicatorNoCRS.svg"))
 
+        # Word wrapping of long layer/group names (off by default)
+        self.wrap_enabled = QSettings().value(WRAP_SETTING_KEY, False, type=bool)
+
+    # ---------------------------------------------------------------- wrapping
+
+    def _node_for(self, index):
+        """
+        Returns the layer tree node for an index, or None for legend/symbology
+        rows (those are left exactly as QGIS draws them).
+        """
+        try:
+            return self.layer_color_plugin.layer_tree_view.index2node(index)
+        except Exception:
+            return None
+
+    def _indentation(self, index):
+        """
+        Horizontal space the tree view uses for the expand arrows of this row.
+        """
+        view = self.layer_color_plugin.layer_tree_view
+        depth = 0
+        parent = index.parent()
+        while parent.isValid():
+            depth += 1
+            parent = parent.parent()
+        return view.indentation() * (depth + 1)
+
+    def _reserved_right(self, index, line_height):
+        """
+        Width kept free on the right for the status icon drawn by paint().
+        Layer nodes always reserve it so the layout does not jump when a layer
+        becomes invalid; groups never get an icon.
+        """
+        node = self._node_for(index)
+        if node is not None and QgsLayerTree.isLayer(node):
+            return line_height + 6
+        return 0
+
+    def _wrap_width(self, option, index, line_height):
+        """
+        Width available for the name text: the visible panel width, minus the
+        tree indentation, the item's own icon/checkbox, and the status icon.
+        The viewport width is used (not option.rect) because QGIS sizes the
+        layer tree column to its widest item, so option.rect can be far wider
+        than what the user actually sees.
+        """
+        view = self.layer_color_plugin.layer_tree_view
+        if option.widget:
+            total = option.widget.viewport().width()
+        elif view:
+            total = view.viewport().width()
+        else:
+            total = option.rect.width()
+        # Space taken by the item's own decoration (icon + checkbox + margins).
+        # decorationSize can be invalid (-1) depending on how the option was
+        # built, so fall back to one line's height.
+        decoration_width = option.decorationSize.width()
+        if decoration_width < 0:
+            decoration_width = line_height
+        decoration = decoration_width + 2 * line_height
+        usable = total - self._indentation(index) - decoration - self._reserved_right(index, line_height)
+        return max(40, usable)
+
+    def _wraps(self, index):
+        """
+        True when this row's text should be wrapped. This covers layers, groups
+        and the symbology (legend) rows underneath a layer.
+        """
+        return self.wrap_enabled
+
+    def _breakable(self, text):
+        """
+        Returns the text with zero-width spaces after the characters layer names
+        are usually built from, so wrapping prefers to break there instead of
+        mid-word ("ovezeti_jel_terv_" + "feliratok" rather than
+        "ovezeti_jel_terv_felirato" + "k"). The inserted characters have no
+        width, so the name still reads exactly as before.
+        """
+        if not text:
+            return text
+        parts = []
+        for char in text:
+            parts.append(char)
+            if char in WRAP_BREAK_CHARS:
+                parts.append("​")
+        return "".join(parts)
+
+    def _measure(self, text, font, width):
+        """
+        Lays the text out at the given width and returns (rect, flags).
+
+        Word wrapping is tried first so breaks land on the name's own
+        separators; if a piece still does not fit (a name with no separators),
+        it is measured again allowing a break anywhere.
+        """
+        metrics = QFontMetrics(font)
+        rect = metrics.boundingRect(QRect(0, 0, width, 10000), WRAP_TEXT_FLAGS, text)
+        if rect.width() > width:
+            rect = metrics.boundingRect(
+                QRect(0, 0, width, 10000), WRAP_TEXT_FLAGS_ANYWHERE, text
+            )
+            return rect, WRAP_TEXT_FLAGS_ANYWHERE
+        return rect, WRAP_TEXT_FLAGS
+
+    def _wrapped_rect(self, opt, index, line_height):
+        """Bounding rect of the wrapped name text."""
+        width = self._wrap_width(opt, index, line_height)
+        rect, _flags = self._measure(self._breakable(opt.text or ""), opt.font, width)
+        return rect
+
     def sizeHint(self, option, index):
         """
-        Extends the default size hint to use the full width of the viewport.
+        Extends the default size hint to use the full width of the viewport,
+        and makes the row taller when its name needs more than one line.
+
+        The width is the viewport width minus this row's indentation: QGIS sizes
+        the column to the widest item, so returning the full viewport width here
+        would push the column past the panel and add a horizontal scroll bar.
         """
         base_size = super().sizeHint(option, index)
+        view = self.layer_color_plugin.layer_tree_view
+        viewport_width = None
         if option.widget:
-            width = option.widget.viewport().width()
-            return QSize(width, base_size.height())
-        return base_size
+            viewport_width = option.widget.viewport().width()
+        elif view:
+            viewport_width = view.viewport().width()
+
+        height = base_size.height()
+        if self._wraps(index):
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            text_rect = self._wrapped_rect(opt, index, base_size.height())
+            height = max(height, text_rect.height() + 4)
+
+        if viewport_width is None:
+            return QSize(base_size.width(), height)
+        return QSize(max(40, viewport_width - self._indentation(index)), height)
 
     def paint(self, painter, option, index):
         """
@@ -405,6 +704,7 @@ class LayerColorDelegate(QStyledItemDelegate):
         self.initStyleOption(opt, index)
 
         invert_icon = False  # Flag to decide if the icon should be inverted
+        chosen_text_color = None  # Set when a highlight color dictates the text color
 
         # Get the node corresponding to the current index
         node = self.layer_color_plugin.layer_tree_view.index2node(index)
@@ -446,7 +746,55 @@ class LayerColorDelegate(QStyledItemDelegate):
                     invert_icon = True
 
         style = option.widget.style() if option.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+
+        # Height of a single line of text for this row, used to size the status
+        # icon and to position wrapped text. Taken before the row was made
+        # taller so a wrapped row does not get an oversized icon.
+        line_height = super().sizeHint(option, index).height()
+
+        if self._wraps(index) and opt.text:
+            # Qt's own item drawing only elides to one line, and its WrapText
+            # feature breaks at whitespace only, so the name text is drawn here
+            # instead: let the style draw the background/selection with the text
+            # suppressed, then draw the wrapped text on top.
+            text_rect = style.subElementRect(
+                QStyle.SubElement.SE_ItemViewItemText, opt, option.widget
+            )
+            text = self._breakable(opt.text)
+            opt.text = ""
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+
+            wrap_width = self._wrap_width(option, index, line_height)
+            needed, text_flags = self._measure(text, opt.font, wrap_width)
+            # Center a single line vertically; start multi-line text at the top
+            align = (
+                Qt.AlignmentFlag.AlignVCenter
+                if needed.height() <= line_height
+                else Qt.AlignmentFlag.AlignTop
+            )
+
+            if opt.state & QStyle.StateFlag.State_Selected:
+                pen_color = opt.palette.color(QPalette.ColorRole.HighlightedText)
+            elif chosen_text_color is not None:
+                pen_color = chosen_text_color
+            else:
+                pen_color = opt.palette.color(QPalette.ColorRole.Text)
+
+            painter.save()
+            painter.setPen(pen_color)
+            painter.drawText(
+                QRect(
+                    text_rect.left(),
+                    opt.rect.top() + 2,
+                    wrap_width,
+                    opt.rect.height() - 4,
+                ),
+                text_flags | align,
+                text,
+            )
+            painter.restore()
+        else:
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
 
         # If the node represents a layer, draw its corresponding icon on the right
         if node and QgsLayerTree.isLayer(node):
@@ -466,11 +814,17 @@ class LayerColorDelegate(QStyledItemDelegate):
 
             if icon_to_draw and not icon_to_draw.isNull():
                 available_width = (option.widget.viewport().width() if option.widget else opt.rect.width())
-                icon_size = icon_to_draw.actualSize(opt.rect.size())
+                # Cap the icon to one line's height: these are SVGs, so on a
+                # wrapped (taller) row actualSize() would scale them up.
+                cap = QSize(min(opt.rect.height(), line_height), min(opt.rect.height(), line_height))
+                icon_size = icon_to_draw.actualSize(cap)
                 icon_x = available_width - icon_size.width() - 2
+                # Align with the first line of text rather than the row center,
+                # so the icon stays next to the name on multi-line rows.
+                icon_y = opt.rect.top() + max(0, (line_height - icon_size.height()) // 2)
                 icon_rect = QRect(
                     icon_x,
-                    opt.rect.top() + (opt.rect.height() - icon_size.height()) // 2,
+                    icon_y,
                     icon_size.width(),
                     icon_size.height()
                 )

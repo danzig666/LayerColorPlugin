@@ -7,7 +7,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=This plugin enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. 
 about=It streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers or groups through custom background colors. This plugin adds a menu called "Layer Highlight Color", located above the "Properties" in the "Layer Properties" menu. Always choose pastel or lighter colors. The code implements "WCAG 2.0" contrast ratio checking to avoid colors that can make hard to read the layer text. 
-version=0.7
+version=0.8
 
 homepage=https://github.com/danzig666/LayerColorPlugin
 tracker=https://github.com/danzig666/LayerColorPlugin/issues
@@ -17,6 +17,13 @@ deprecated=False
 icon=icon.png
 
 changelog=
+
+ Version 0.8:
+ * New: optional wrapping of long layer, group and symbology names over several lines, with rows growing only where needed and re-wrapping when the panel is resized.
+ * Names break at their own separators (_ - . /) rather than mid-word; a name with no separators falls back to breaking anywhere.
+ * Toggle in "Plugins > Layer Color Plugin > Wrap Long Layer Names" and in the layer context menu; the choice is remembered between sessions.
+ * Fixes a horizontal scroll bar in the Layers panel: row widths no longer ignore the tree indentation (applies with wrapping on or off).
+ * Status icons are capped to one line's height so they are not scaled up on wrapped rows.
 
  Version 0.7:
  * Disabling/reloading the plugin no longer deletes highlight colors from the open project.

@@ -77,6 +77,19 @@ This visual organization system significantly reduces the time needed to locate 
 - Provides color selection through a standard color dialog
 - Maintains color persistence across project saves and loads
 
+### Long Name Wrapping (optional)
+Long layer, group and symbology names are normally cut off with an ellipsis in the
+Layers panel. This plugin can wrap them over several lines instead:
+
+- Turn it on in **Plugins → Layer Color Plugin → Wrap Long Layer Names**, or from
+  the **Layer Highlight Color** submenu in the layer context menu
+- Only the rows that need it become taller; everything else keeps its usual height
+- Names re-wrap when you resize the Layers panel
+- Breaks are made at the separators names are built from (`_`, `-`, `.`, `/`), so a
+  name reads as `ovezeti_` / `jel_terv_` / `feliratok` rather than being split
+  mid-word. A name with no separators is broken wherever it has to be
+- The setting is remembered between QGIS sessions and is off by default
+
 ### Accessibility
 - Implements WCAG 2.0 contrast ratio checking
 - Warns users when selected colors might make text difficult to read
