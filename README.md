@@ -1,7 +1,9 @@
 # Layer Color Plugin
 
 
-![ScreenShoot](screenshot.png "Layers panel example using Layer Color Plugin")
+![Layers panel with highlight colors applied to groups and layers](screenshot.png "Layers panel example using Layer Color Plugin")
+
+<sub>Screenshots are drawn by this plugin's own layer tree delegate, using sample layer names.</sub>
 
 
 This is a QGIS plugin that enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. This plugin streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers through custom background colors. 
@@ -81,6 +83,8 @@ This visual organization system significantly reduces the time needed to locate 
 Long layer, group and symbology names are normally cut off with an ellipsis in the
 Layers panel. This plugin can wrap them over several lines instead:
 
+![The same Layers panel with wrapping off and on](screenshot-wrapping.png "Long name wrapping, off and on")
+
 - Turn it on in **Plugins → Layer Color Plugin → Wrap Long Layer Names**, or from
   the **Layer Highlight Color** submenu in the layer context menu
 - Only the rows that need it become taller; everything else keeps its usual height
@@ -90,10 +94,20 @@ Layers panel. This plugin can wrap them over several lines instead:
   mid-word. A name with no separators is broken wherever it has to be
 - The setting is remembered between QGIS sessions and is off by default
 
+### Layer Indicators
+To color the rows, this plugin takes over the drawing of the layer tree, which
+would otherwise hide QGIS's own layer indicators. It draws them itself instead, so
+the small icons at the right of a row — temporary (scratch) layer, missing CRS,
+broken layer, applied filter, embedded layer, notes — stay visible, together with
+their tooltips. On a wrapped row the icons keep their normal size and line up with
+the first line of the name.
+
 ### Accessibility
 - Implements WCAG 2.0 contrast ratio checking
-- Warns users when selected colors might make text difficult to read
-- Calculates contrast ratios against black text using WCAG AA standards (4.5:1 ratio)
+- Picks the layer name color automatically: the name is drawn in black or white,
+  whichever contrasts better with the chosen background, measured against the
+  WCAG AA threshold (4.5:1)
+- Inverts the layer status icons on dark backgrounds so they stay readable
 
 ## Technical Details
 ### Color Handling

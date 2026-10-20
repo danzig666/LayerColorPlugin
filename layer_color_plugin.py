@@ -2,6 +2,7 @@ import os
 from qgis.core import QgsMessageLog, Qgis, QgsProject, QgsLayerTree
 from qgis.PyQt.QtWidgets import (
     QMenu,
+    QToolTip,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
@@ -9,7 +10,7 @@ from qgis.PyQt.QtWidgets import (
     QWidgetAction,
     QColorDialog
 )
-from qgis.PyQt.QtGui import QBrush, QColor, QFontMetrics, QIcon, QPalette, QPixmap
+from qgis.PyQt.QtGui import QBrush, QColor, QFontMetrics, QIcon, QPainter, QPalette, QPixmap
 from qgis.PyQt.QtCore import (
     Qt,
     QEvent,
@@ -205,6 +206,12 @@ class LayerColorPlugin:
                 return
             for index in self.visible_indexes():
                 delegate.sizeHintChanged.emit(index)
+            # sizeHintChanged alone can leave rows at their old height, which
+            # would clip the wrapped text, so ask for a full relayout as well.
+            try:
+                self.layer_tree_view.doItemsLayout()
+            except Exception:
+                pass
             self.layer_tree_view.viewport().update()
         except Exception as e:
             log_message(f"Error refreshing row heights: {str(e)}")
@@ -583,16 +590,109 @@ class LayerColorDelegate(QStyledItemDelegate):
             parent = parent.parent()
         return view.indentation() * (depth + 1)
 
-    def _reserved_right(self, index, line_height):
+    # ------------------------------------------------------------- indicators
+
+    def _indicators(self, index):
         """
-        Width kept free on the right for the status icon drawn by paint().
-        Layer nodes always reserve it so the layout does not jump when a layer
-        becomes invalid; groups never get an icon.
+        QGIS's own layer tree indicators for this row (filter, temporary layer,
+        embedded, notes, no CRS, broken layer...). QGIS paints these from its
+        own item delegate, which this plugin replaces, so they are drawn here
+        instead. Returns an empty list for symbology rows.
         """
         node = self._node_for(index)
-        if node is not None and QgsLayerTree.isLayer(node):
-            return line_height + 6
-        return 0
+        if node is None:
+            return []
+        try:
+            return list(self.layer_color_plugin.layer_tree_view.indicators(node) or [])
+        except Exception:
+            return []
+
+    def _fallback_icon(self, index):
+        """
+        Icon used only when QGIS reports no indicators for a layer, so the row
+        still shows that it is in-memory, virtual, broken or missing a CRS.
+        """
+        node = self._node_for(index)
+        if node is None or not QgsLayerTree.isLayer(node):
+            return None
+        # Guarded: this runs from sizeHint() and paint(), and an exception
+        # escaping into Qt's layout or painting code crashes QGIS outright.
+        try:
+            layer = node.layer()
+            if layer is None or not layer.isValid():
+                return self.default_missing_icon
+            if not layer.crs().isValid() and layer.isSpatial():
+                return self.default_nocrs_icon
+            provider = layer.dataProvider()
+            provider_name = provider.name() if provider else ""
+            if provider_name == "memory":
+                return self.default_memory_icon
+            if provider_name == "virtual":
+                return self.default_virtual_icon
+        except Exception as e:
+            log_message(f"Error choosing status icon: {str(e)}")
+        return None
+
+    def _right_items(self, index, line_height, row_top, viewport_width):
+        """
+        Lays out what is drawn at the right edge of a row and returns a list of
+        (indicator_or_None, icon, rect), left to right.
+
+        The strip is right-aligned against the viewport the way QGIS does it,
+        leaving room for the layer mark, so the icons stay where QGIS expects
+        them. Icons are squares of one line's height, so a wrapped (taller) row
+        does not scale them up.
+        """
+        view = self.layer_color_plugin.layer_tree_view
+        side = max(8, line_height)
+        spacing = max(1, side // 10)
+        try:
+            mark_width = view.layerMarkWidth()
+        except Exception:
+            mark_width = 0
+
+        # Guarded as a whole: callers run inside Qt's layout and painting, where
+        # an escaping exception brings QGIS down rather than raising in Python.
+        try:
+            entries = [(ind, ind.icon()) for ind in self._indicators(index)]
+            if not entries:
+                fallback = self._fallback_icon(index)
+                if fallback is not None:
+                    entries = [(None, fallback)]
+        except Exception as e:
+            log_message(f"Error collecting layer indicators: {str(e)}")
+            return []
+        if not entries:
+            return []
+
+        top = row_top + max(0, (line_height - side) // 2)
+        right = viewport_width - spacing - mark_width
+        items = []
+        for position, (indicator, icon) in enumerate(reversed(entries)):
+            left = right - side * (position + 1)
+            items.append((indicator, icon, QRect(left, top, side, side)))
+        items.reverse()
+        return items
+
+    def _reserved_right(self, index, line_height):
+        """
+        Width kept free on the right so wrapped text does not run under the
+        indicator strip.
+        """
+        view = self.layer_color_plugin.layer_tree_view
+        try:
+            viewport_width = view.viewport().width()
+        except Exception:
+            return 0
+        items = self._right_items(index, line_height, 0, viewport_width)
+        if not items:
+            # Layer rows still reserve room, so the layout does not jump when a
+            # layer becomes invalid and gains an icon.
+            node = self._node_for(index)
+            if node is not None and QgsLayerTree.isLayer(node):
+                return line_height + 6
+            return 0
+        return max(0, viewport_width - items[0][2].left() + 4)
 
     def _wrap_width(self, option, index, line_height):
         """
@@ -602,22 +702,43 @@ class LayerColorDelegate(QStyledItemDelegate):
         layer tree column to its widest item, so option.rect can be far wider
         than what the user actually sees.
         """
-        view = self.layer_color_plugin.layer_tree_view
-        if option.widget:
-            total = option.widget.viewport().width()
-        elif view:
-            total = view.viewport().width()
-        else:
-            total = option.rect.width()
-        # Space taken by the item's own decoration (icon + checkbox + margins).
-        # decorationSize can be invalid (-1) depending on how the option was
-        # built, so fall back to one line's height.
-        decoration_width = option.decorationSize.width()
-        if decoration_width < 0:
-            decoration_width = line_height
-        decoration = decoration_width + 2 * line_height
-        usable = total - self._indentation(index) - decoration - self._reserved_right(index, line_height)
+        total = self._viewport_width(option)
+        usable = (
+            total
+            - self._indentation(index)
+            - self._text_left_offset(option, index, line_height)
+            - self._reserved_right(index, line_height)
+        )
         return max(40, usable)
+
+    def _viewport_width(self, option):
+        """Width of the visible panel, whatever option was handed to us."""
+        if option.widget:
+            return option.widget.viewport().width()
+        view = self.layer_color_plugin.layer_tree_view
+        if view is not None:
+            return view.viewport().width()
+        return option.rect.width()
+
+    def _text_left_offset(self, option, index, line_height):
+        """
+        Distance from the item's left edge to where its text starts, i.e. the
+        room taken by the checkbox and the layer icon.
+
+        The style is asked using a probe rectangle rather than the item's own
+        rect: sizeHint() can be called before a row has a usable rect, and
+        sizeHint() and paint() must agree on the width or the text is laid out
+        for one width and drawn at another, losing the last line.
+        """
+        style = option.widget.style() if option.widget else QApplication.style()
+        probe = QStyleOptionViewItem(option)
+        self.initStyleOption(probe, index)
+        width = max(32, self._viewport_width(option) - self._indentation(index))
+        probe.rect = QRect(0, 0, width, max(1, line_height))
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, probe, option.widget
+        )
+        return max(0, min(text_rect.left(), width - 32))
 
     def _wraps(self, index):
         """
@@ -666,6 +787,27 @@ class LayerColorDelegate(QStyledItemDelegate):
         rect, _flags = self._measure(self._breakable(opt.text or ""), opt.font, width)
         return rect
 
+    def helpEvent(self, event, view, option, index):
+        """
+        Shows the indicator's tooltip ("Temporary scratch layer only!", the
+        filter expression, and so on). QGIS serves these from its own item
+        delegate, which this plugin replaces, so they are served here instead.
+        """
+        try:
+            if event.type() == QEvent.Type.ToolTip:
+                line_height = QStyledItemDelegate.sizeHint(self, option, index).height()
+                for indicator, _icon, rect in self._right_items(
+                    index, line_height, option.rect.top(), view.viewport().width()
+                ):
+                    if indicator is not None and rect.contains(event.pos()):
+                        tooltip = indicator.toolTip()
+                        if tooltip:
+                            QToolTip.showText(event.globalPos(), tooltip, view)
+                            return True
+        except Exception as e:
+            log_message(f"Error showing indicator tooltip: {str(e)}")
+        return super().helpEvent(event, view, option, index)
+
     def sizeHint(self, option, index):
         """
         Extends the default size hint to use the full width of the viewport,
@@ -694,6 +836,66 @@ class LayerColorDelegate(QStyledItemDelegate):
             return QSize(base_size.width(), height)
         return QSize(max(40, viewport_width - self._indentation(index)), height)
 
+    def _draw_right_items(self, painter, opt, option, index, line_height, invert_icon,
+                          row_background=None):
+        """
+        Draws QGIS's layer tree indicators (or, when it reports none, this
+        plugin's own status icon) at the right edge of the row.
+        """
+        available_width = self._viewport_width(option)
+        for indicator, icon, icon_rect in self._right_items(
+            index, line_height, opt.rect.top(), available_width
+        ):
+            if icon is None or icon.isNull():
+                continue
+            if indicator is None:
+                # The plugin's own monochrome icon: inverted on a dark
+                # background, as before.
+                size = icon.actualSize(icon_rect.size())
+                drawn = QRect(
+                    icon_rect.left() + (icon_rect.width() - size.width()) // 2,
+                    icon_rect.top() + (icon_rect.height() - size.height()) // 2,
+                    size.width(),
+                    size.height(),
+                )
+                if invert_icon:
+                    pixmap = icon.pixmap(size)
+                    image = pixmap.toImage()
+                    image.invertPixels()
+                    painter.drawPixmap(drawn, QPixmap.fromImage(image))
+                else:
+                    icon.paint(painter, drawn, Qt.AlignmentFlag.AlignCenter)
+                continue
+
+            # QGIS indicators are full-color icons, so they are not inverted.
+            # They sit on a chip in the row's own background color, the way QGIS
+            # backs them, so they stay legible when text runs under them.
+            if opt.state & QStyle.StateFlag.State_Selected:
+                chip = opt.palette.color(QPalette.ColorRole.Highlight)
+            elif invert_icon:
+                # Dark highlight color: a light chip keeps the icon readable
+                chip = opt.palette.color(QPalette.ColorRole.Base)
+            elif row_background is not None:
+                chip = row_background
+            else:
+                chip = opt.palette.color(QPalette.ColorRole.Base)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(chip)
+            painter.drawRoundedRect(icon_rect.adjusted(1, 1, -1, -1), 2, 2)
+            painter.restore()
+
+            mode = QIcon.Mode.Normal
+            if opt.state & QStyle.StateFlag.State_Selected:
+                mode = QIcon.Mode.Selected
+            icon.paint(
+                painter,
+                icon_rect.adjusted(1, 1, -1, -1),
+                Qt.AlignmentFlag.AlignCenter,
+                mode,
+            )
+
     def paint(self, painter, option, index):
         """
         Custom painting of each layer tree item, including setting a background color
@@ -705,6 +907,7 @@ class LayerColorDelegate(QStyledItemDelegate):
 
         invert_icon = False  # Flag to decide if the icon should be inverted
         chosen_text_color = None  # Set when a highlight color dictates the text color
+        row_background = None  # The node's highlight color, when it has one
 
         # Get the node corresponding to the current index
         node = self.layer_color_plugin.layer_tree_view.index2node(index)
@@ -712,6 +915,7 @@ class LayerColorDelegate(QStyledItemDelegate):
             color = node.customProperty('highlight_color', None)
             if color:
                 bg = QColor(color)
+                row_background = bg
                 opt.backgroundBrush = QBrush(bg)
 
                 # Helper function to compute the luminance of a color
@@ -757,15 +961,41 @@ class LayerColorDelegate(QStyledItemDelegate):
             # feature breaks at whitespace only, so the name text is drawn here
             # instead: let the style draw the background/selection with the text
             # suppressed, then draw the wrapped text on top.
-            text_rect = style.subElementRect(
-                QStyle.SubElement.SE_ItemViewItemText, opt, option.widget
-            )
-            text = self._breakable(opt.text)
+            # Same offset sizeHint() used, so the text is drawn at the width it
+            # was measured for
+            text_left = opt.rect.left() + self._text_left_offset(option, index, line_height)
+            raw_text = opt.text
+            text = self._breakable(raw_text)
             opt.text = ""
             style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
 
             wrap_width = self._wrap_width(option, index, line_height)
             needed, text_flags = self._measure(text, opt.font, wrap_width)
+
+            if needed.height() > opt.rect.height() - 2:
+                # The row is shorter than the wrapped text needs, which happens
+                # if the view has not applied new row heights yet. Draw a single
+                # elided line instead of silently cutting the last line off.
+                metrics = QFontMetrics(opt.font)
+                elided = metrics.elidedText(
+                    raw_text, Qt.TextElideMode.ElideRight, max(16, wrap_width)
+                )
+                painter.save()
+                if opt.state & QStyle.StateFlag.State_Selected:
+                    painter.setPen(opt.palette.color(QPalette.ColorRole.HighlightedText))
+                elif chosen_text_color is not None:
+                    painter.setPen(chosen_text_color)
+                else:
+                    painter.setPen(opt.palette.color(QPalette.ColorRole.Text))
+                painter.drawText(
+                    QRect(text_left, opt.rect.top(), wrap_width, opt.rect.height()),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    elided,
+                )
+                painter.restore()
+                self._draw_right_items(painter, opt, option, index, line_height,
+                                       invert_icon, row_background)
+                return
             # Center a single line vertically; start multi-line text at the top
             align = (
                 Qt.AlignmentFlag.AlignVCenter
@@ -784,7 +1014,7 @@ class LayerColorDelegate(QStyledItemDelegate):
             painter.setPen(pen_color)
             painter.drawText(
                 QRect(
-                    text_rect.left(),
+                    text_left,
                     opt.rect.top() + 2,
                     wrap_width,
                     opt.rect.height() - 4,
@@ -796,44 +1026,5 @@ class LayerColorDelegate(QStyledItemDelegate):
         else:
             style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
 
-        # If the node represents a layer, draw its corresponding icon on the right
-        if node and QgsLayerTree.isLayer(node):
-            layer = node.layer()
-            icon_to_draw = None
-            if layer is None or not layer.isValid():
-                icon_to_draw = self.default_missing_icon
-            elif not layer.crs().isValid() and layer.isSpatial():
-                icon_to_draw = self.default_nocrs_icon
-            else:
-                provider = layer.dataProvider()
-                provider_name = provider.name() if provider else ""
-                if provider_name == "memory":
-                    icon_to_draw = self.default_memory_icon
-                elif provider_name == "virtual":
-                    icon_to_draw = self.default_virtual_icon
-
-            if icon_to_draw and not icon_to_draw.isNull():
-                available_width = (option.widget.viewport().width() if option.widget else opt.rect.width())
-                # Cap the icon to one line's height: these are SVGs, so on a
-                # wrapped (taller) row actualSize() would scale them up.
-                cap = QSize(min(opt.rect.height(), line_height), min(opt.rect.height(), line_height))
-                icon_size = icon_to_draw.actualSize(cap)
-                icon_x = available_width - icon_size.width() - 2
-                # Align with the first line of text rather than the row center,
-                # so the icon stays next to the name on multi-line rows.
-                icon_y = opt.rect.top() + max(0, (line_height - icon_size.height()) // 2)
-                icon_rect = QRect(
-                    icon_x,
-                    icon_y,
-                    icon_size.width(),
-                    icon_size.height()
-                )
-                if invert_icon:
-                    # Create a pixmap from the icon and invert its colors
-                    pixmap = icon_to_draw.pixmap(icon_size)
-                    image = pixmap.toImage()
-                    image.invertPixels()  # Inverts all the pixels
-                    inverted_pixmap = QPixmap.fromImage(image)
-                    painter.drawPixmap(icon_rect, inverted_pixmap)
-                else:
-                    icon_to_draw.paint(painter, icon_rect, Qt.AlignmentFlag.AlignCenter)
+        self._draw_right_items(painter, opt, option, index, line_height, invert_icon,
+                               row_background)

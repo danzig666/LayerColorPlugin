@@ -7,7 +7,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=This plugin enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. 
 about=It streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers or groups through custom background colors. This plugin adds a menu called "Layer Highlight Color", located above the "Properties" in the "Layer Properties" menu. Always choose pastel or lighter colors. The code implements "WCAG 2.0" contrast ratio checking to avoid colors that can make hard to read the layer text. 
-version=0.8
+version=0.9
 
 homepage=https://github.com/danzig666/LayerColorPlugin
 tracker=https://github.com/danzig666/LayerColorPlugin/issues
@@ -17,6 +17,14 @@ deprecated=False
 icon=icon.png
 
 changelog=
+
+ Version 0.9:
+ * Restores QGIS's layer indicators (temporary layer, missing CRS, broken layer, filter, notes...) with their tooltips: the plugin replaces the layer tree delegate, which otherwise hides them. They are drawn at one line's height and sit on a chip so they stay readable over text and over dark highlight colors.
+ * Fixes wrapped names being laid out for one width and drawn at another, which could cut off the last line of a name ("Sample points" drawn as "Sample"). The text start is now measured from the style instead of estimated.
+ * Fixes wrapping far too narrow, which forced mid-word breaks even when the name had separators to break at.
+ * Row heights are refreshed with a full relayout, so a row can no longer be left too short for its text; if it ever is, the name is elided on one line rather than silently cut.
+ * Hardens the drawing paths: an exception raised while Qt lays out or paints a row crashed QGIS outright, and is now caught and logged.
+ * README: corrected the accessibility description (this fork picks black or white text automatically and does not show a contrast warning) and added screenshots of this fork.
 
  Version 0.8:
  * New: optional wrapping of long layer, group and symbology names over several lines, with rows growing only where needed and re-wrapping when the panel is resized.
