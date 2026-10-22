@@ -7,7 +7,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=This plugin enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. 
 about=It streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers or groups through custom background colors. This plugin adds a menu called "Layer Highlight Color", located above the "Properties" in the "Layer Properties" menu. Always choose pastel or lighter colors. The code implements "WCAG 2.0" contrast ratio checking to avoid colors that can make hard to read the layer text. 
-version=0.9
+version=0.10
 
 homepage=https://github.com/danzig666/LayerColorPlugin
 tracker=https://github.com/danzig666/LayerColorPlugin/issues
@@ -17,6 +17,12 @@ deprecated=False
 icon=icon.png
 
 changelog=
+
+ Version 0.10:
+ * Makes resizing the Layers panel fast again with large projects. Names are re-wrapped once when the drag stops, instead of every row being re-measured at every intermediate width.
+ * Fixes the re-wrap itself being O(rows squared): it emitted a size hint change per row, each triggering layout work. With 1200 layers that took over two minutes; it is now about 80 ms.
+ * Caches the expensive per-row lookups (where the style places the text, the wrapped text measurement, the layer's provider), which QGIS's stylesheet style made especially costly.
+ * Measured with 1200 rows: dragging 66.9 ms -> 7.2 ms per step, re-wrap 125.6 s -> 0.08 s. Dragging no longer gets slower as layers are added.
 
  Version 0.9:
  * Restores QGIS's layer indicators (temporary layer, missing CRS, broken layer, filter, notes...) with their tooltips: the plugin replaces the layer tree delegate, which otherwise hides them. They are drawn at one line's height and sit on a chip so they stay readable over text and over dark highlight colors.

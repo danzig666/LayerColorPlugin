@@ -95,7 +95,8 @@ class LayerColorPlugin:
             self.rewrap_timer.setSingleShot(True)
             self.rewrap_timer.setInterval(60)
             self.rewrap_timer.timeout.connect(self.refresh_row_heights)
-            self.resize_filter = ViewportResizeFilter(self.rewrap_timer, self.layer_tree_view)
+            self.resize_filter = ViewportResizeFilter(self.rewrap_timer, self.delegate,
+                                                      self.layer_tree_view)
             self.layer_tree_view.viewport().installEventFilter(self.resize_filter)
 
             # Add the wrap toggle to the QGIS "Plugins" menu, so the setting can
@@ -204,14 +205,17 @@ class LayerColorPlugin:
             delegate = getattr(self, "delegate", None)
             if delegate is None:
                 return
-            for index in self.visible_indexes():
-                delegate.sizeHintChanged.emit(index)
-            # sizeHintChanged alone can leave rows at their old height, which
-            # would clip the wrapped text, so ask for a full relayout as well.
+            # The drag is over: measure for real again.
+            delegate.resizing = False
+            delegate.invalidate_caches()
+            # One full relayout recomputes every row height. Emitting
+            # sizeHintChanged per row instead costs O(rows^2) - with 400 layers
+            # that took 17 seconds, against about 40 ms for the relayout.
             try:
                 self.layer_tree_view.doItemsLayout()
             except Exception:
-                pass
+                for index in self.visible_indexes():
+                    delegate.sizeHintChanged.emit(index)
             self.layer_tree_view.viewport().update()
         except Exception as e:
             log_message(f"Error refreshing row heights: {str(e)}")
@@ -226,6 +230,7 @@ class LayerColorPlugin:
                 return
             enabled = bool(enabled)
             delegate.wrap_enabled = enabled
+            delegate.invalidate_caches()
 
             # Keep the Plugins menu entry in step when toggled from the layer
             # tree context menu. Signals are blocked so setChecked() does not
@@ -515,6 +520,10 @@ class LayerColorPlugin:
 
             root = self.iface.layerTreeView().layerTreeModel().rootGroup()
             load_node_colors(root)
+            # The tree is a different one now, so cached per-row measurements
+            # and layer lookups no longer apply.
+            if getattr(self, "delegate", None) is not None:
+                self.delegate.invalidate_caches(drop_heights=True)
             self.layer_tree_view.viewport().update()
             log_message("All colors restored successfully.")
         except Exception as e:
@@ -529,9 +538,10 @@ class ViewportResizeFilter(QObject):
     filter can propagate into Qt and, on Qt6, take QGIS down with it.
     """
 
-    def __init__(self, timer, parent=None):
+    def __init__(self, timer, delegate=None, parent=None):
         super().__init__(parent)
         self.timer = timer
+        self.delegate = delegate
         self.last_width = None
 
     def eventFilter(self, obj, event):
@@ -541,6 +551,11 @@ class ViewportResizeFilter(QObject):
                 # Only react to width changes; height changes cannot re-wrap
                 if width != self.last_width:
                     self.last_width = width
+                    # Mark the drag as in progress so rows are not re-measured
+                    # at every intermediate width; the timer re-wraps them once
+                    # the drag stops.
+                    if self.delegate is not None:
+                        self.delegate.resizing = True
                     if self.timer is not None:
                         self.timer.start()
         except Exception as e:
@@ -565,6 +580,47 @@ class LayerColorDelegate(QStyledItemDelegate):
 
         # Word wrapping of long layer/group names (off by default)
         self.wrap_enabled = QSettings().value(WRAP_SETTING_KEY, False, type=bool)
+
+        # Caches. sizeHint() and paint() run for every row on every relayout,
+        # and QGIS relayouts the whole tree on each resize step, so the costly
+        # parts (asking the style where text starts, measuring wrapped text,
+        # inspecting a layer's provider) are remembered rather than redone.
+        self._offset_cache = {}   # (depth, line height) -> text left offset
+        self._measure_cache = {}  # (text, width) -> (height, flags)
+        self._icon_cache = {}     # row key -> fallback icon
+        self._row_heights = {}    # row key -> height from the last full layout
+        self._cache_generation = 0
+
+        # While the panel is being dragged, rows keep the heights they already
+        # have instead of being re-measured at every intermediate width. The
+        # names are re-wrapped once, when the drag stops.
+        self.resizing = False
+
+    def invalidate_caches(self, drop_heights=False):
+        """
+        Drops cached layout measurements. Called when something that feeds them
+        changes: the wrap setting, the panel width, or the project contents.
+
+        Row heights are kept by default: they are what a drag reuses instead of
+        re-measuring, and the relayout that follows overwrites them anyway.
+        Pass drop_heights for a different project, where the rows are not the
+        same rows at all.
+        """
+        self._offset_cache.clear()
+        self._measure_cache.clear()
+        self._icon_cache.clear()
+        if drop_heights:
+            self._row_heights.clear()
+        self._cache_generation += 1
+
+    @staticmethod
+    def _index_key(index):
+        """A hashable identity for a row, stable while the tree is unchanged."""
+        key = []
+        while index.isValid():
+            key.append(index.row())
+            index = index.parent()
+        return tuple(key)
 
     # ---------------------------------------------------------------- wrapping
 
@@ -615,23 +671,36 @@ class LayerColorDelegate(QStyledItemDelegate):
         node = self._node_for(index)
         if node is None or not QgsLayerTree.isLayer(node):
             return None
+        # Cached: inspecting the layer's validity, CRS and provider costs about
+        # 30 microseconds, and this runs per row on every relayout. The cache is
+        # dropped whenever row heights are refreshed or a project is loaded.
+        cache_key = self._index_key(index)
+        cached = self._icon_cache.get(cache_key)
+        if cached is not None and cached[0] == self._cache_generation:
+            return cached[1]
         # Guarded: this runs from sizeHint() and paint(), and an exception
         # escaping into Qt's layout or painting code crashes QGIS outright.
+        icon = None
         try:
             layer = node.layer()
             if layer is None or not layer.isValid():
-                return self.default_missing_icon
-            if not layer.crs().isValid() and layer.isSpatial():
-                return self.default_nocrs_icon
-            provider = layer.dataProvider()
-            provider_name = provider.name() if provider else ""
-            if provider_name == "memory":
-                return self.default_memory_icon
-            if provider_name == "virtual":
-                return self.default_virtual_icon
+                icon = self.default_missing_icon
+            elif not layer.crs().isValid() and layer.isSpatial():
+                icon = self.default_nocrs_icon
+            else:
+                provider = layer.dataProvider()
+                provider_name = provider.name() if provider else ""
+                if provider_name == "memory":
+                    icon = self.default_memory_icon
+                elif provider_name == "virtual":
+                    icon = self.default_virtual_icon
         except Exception as e:
             log_message(f"Error choosing status icon: {str(e)}")
-        return None
+            return None
+        if len(self._icon_cache) > 8000:
+            self._icon_cache.clear()
+        self._icon_cache[cache_key] = (self._cache_generation, icon)
+        return icon
 
     def _right_items(self, index, line_height, row_top, viewport_width):
         """
@@ -730,15 +799,26 @@ class LayerColorDelegate(QStyledItemDelegate):
         sizeHint() and paint() must agree on the width or the text is laid out
         for one width and drawn at another, losing the last line.
         """
-        style = option.widget.style() if option.widget else QApplication.style()
-        probe = QStyleOptionViewItem(option)
-        self.initStyleOption(probe, index)
-        width = max(32, self._viewport_width(option) - self._indentation(index))
-        probe.rect = QRect(0, 0, width, max(1, line_height))
-        text_rect = style.subElementRect(
-            QStyle.SubElement.SE_ItemViewItemText, probe, option.widget
-        )
-        return max(0, min(text_rect.left(), width - 32))
+        indent = self._indentation(index)
+        # Keyed by depth only: the offset depends on the checkbox and icon, not
+        # on how wide the panel is. Asking QGIS's stylesheet style costs about
+        # 50 microseconds, which is far too much to repeat per row per resize.
+        cache_key = (indent, line_height)
+        offset = self._offset_cache.get(cache_key)
+        if offset is None:
+            style = option.widget.style() if option.widget else QApplication.style()
+            probe = QStyleOptionViewItem(option)
+            self.initStyleOption(probe, index)
+            # A generous probe width keeps the result independent of the panel
+            # width, so the cache survives a resize.
+            probe.rect = QRect(0, 0, 10000, max(1, line_height))
+            text_rect = style.subElementRect(
+                QStyle.SubElement.SE_ItemViewItemText, probe, option.widget
+            )
+            offset = max(0, text_rect.left())
+            self._offset_cache[cache_key] = offset
+        width = max(32, self._viewport_width(option) - indent)
+        return min(offset, max(0, width - 32))
 
     def _wraps(self, index):
         """
@@ -772,14 +852,24 @@ class LayerColorDelegate(QStyledItemDelegate):
         separators; if a piece still does not fit (a name with no separators),
         it is measured again allowing a break anywhere.
         """
+        cache_key = (text, width)
+        cached = self._measure_cache.get(cache_key)
+        if cached is not None:
+            height, flags = cached
+            return QRect(0, 0, width, height), flags
+
         metrics = QFontMetrics(font)
         rect = metrics.boundingRect(QRect(0, 0, width, 10000), WRAP_TEXT_FLAGS, text)
+        flags = WRAP_TEXT_FLAGS
         if rect.width() > width:
             rect = metrics.boundingRect(
                 QRect(0, 0, width, 10000), WRAP_TEXT_FLAGS_ANYWHERE, text
             )
-            return rect, WRAP_TEXT_FLAGS_ANYWHERE
-        return rect, WRAP_TEXT_FLAGS
+            flags = WRAP_TEXT_FLAGS_ANYWHERE
+        if len(self._measure_cache) > 8000:
+            self._measure_cache.clear()
+        self._measure_cache[cache_key] = (rect.height(), flags)
+        return rect, flags
 
     def _wrapped_rect(self, opt, index, line_height):
         """Bounding rect of the wrapped name text."""
@@ -817,6 +907,17 @@ class LayerColorDelegate(QStyledItemDelegate):
         the column to the widest item, so returning the full viewport width here
         would push the column past the panel and add a horizontal scroll bar.
         """
+        if self.resizing and self.wrap_enabled:
+            # Fast path for a drag in progress: the row keeps the height it was
+            # last measured at, so neither this plugin nor Qt's own sizeHint
+            # has to do any work per row. The names re-wrap when the drag stops.
+            known = self._row_heights.get(self._index_key(index))
+            if known is not None:
+                return QSize(
+                    max(40, self._viewport_width(option) - self._indentation(index)),
+                    known,
+                )
+
         base_size = super().sizeHint(option, index)
         view = self.layer_color_plugin.layer_tree_view
         viewport_width = None
@@ -827,10 +928,27 @@ class LayerColorDelegate(QStyledItemDelegate):
 
         height = base_size.height()
         if self._wraps(index):
-            opt = QStyleOptionViewItem(option)
-            self.initStyleOption(opt, index)
-            text_rect = self._wrapped_rect(opt, index, base_size.height())
-            height = max(height, text_rect.height() + 4)
+            key = self._index_key(index)
+            known = self._row_heights.get(key)
+            if self.resizing and known is not None:
+                # Mid-drag: reuse the height this row already had. Re-measuring
+                # every row at every intermediate width is what made dragging
+                # the panel slow with a large project. A row we have no height
+                # for is still measured, so rows never collapse to one line
+                # just because a resize happened to be in progress.
+                height = max(height, known)
+            else:
+                # The display text is read from the model rather than through
+                # initStyleOption(), which is far too costly to run per row on
+                # every relayout.
+                text = index.data(Qt.ItemDataRole.DisplayRole)
+                if text:
+                    width = self._wrap_width(option, index, base_size.height())
+                    rect, _flags = self._measure(self._breakable(text), option.font, width)
+                    height = max(height, rect.height() + 4)
+                if len(self._row_heights) > 8000:
+                    self._row_heights.clear()
+                self._row_heights[key] = height
 
         if viewport_width is None:
             return QSize(base_size.width(), height)
