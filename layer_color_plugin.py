@@ -780,6 +780,24 @@ class LayerColorDelegate(QStyledItemDelegate):
         )
         return max(40, usable)
 
+    def _decoration_width(self, index, line_height):
+        """
+        Width of the row's symbol. QGIS hands the layer tree its legend symbols
+        as pixmaps, and their widths differ from layer to layer.
+        """
+        try:
+            decoration = index.data(Qt.ItemDataRole.DecorationRole)
+            if decoration is None:
+                return 0
+            if isinstance(decoration, QPixmap):
+                return decoration.width()
+            if isinstance(decoration, QIcon):
+                return decoration.actualSize(QSize(10000, max(1, line_height))).width()
+        except Exception:
+            pass
+        # Unknown kind of decoration: -1 keeps it in its own cache bucket
+        return -1
+
     def _viewport_width(self, option):
         """Width of the visible panel, whatever option was handed to us."""
         if option.widget:
@@ -800,10 +818,19 @@ class LayerColorDelegate(QStyledItemDelegate):
         for one width and drawn at another, losing the last line.
         """
         indent = self._indentation(index)
-        # Keyed by depth only: the offset depends on the checkbox and icon, not
-        # on how wide the panel is. Asking QGIS's stylesheet style costs about
-        # 50 microseconds, which is far too much to repeat per row per resize.
-        cache_key = (indent, line_height)
+        # The offset depends on the indentation, the checkbox and the width of
+        # the row's own symbol, but not on how wide the panel is. Asking QGIS's
+        # stylesheet style costs about 50 microseconds, far too much to repeat
+        # per row per resize, so the answer is cached per distinct layout.
+        # The symbol width must be part of the key: layer symbols vary in width
+        # (a wide fill swatch against a narrow line symbol), and sharing one
+        # offset between them draws the name on top of the symbol.
+        cache_key = (
+            indent,
+            line_height,
+            self._decoration_width(index, line_height),
+            bool(index.flags() & Qt.ItemFlag.ItemIsUserCheckable),
+        )
         offset = self._offset_cache.get(cache_key)
         if offset is None:
             style = option.widget.style() if option.widget else QApplication.style()

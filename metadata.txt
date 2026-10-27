@@ -7,7 +7,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=This plugin enables users to customize the background colors of layers and groups in the layer tree view, enhancing visual organization and project management. 
 about=It streamlines the organization and management of complex QGIS projects by allowing users to visually distinguish different layers or groups through custom background colors. This plugin adds a menu called "Layer Highlight Color", located above the "Properties" in the "Layer Properties" menu. Always choose pastel or lighter colors. The code implements "WCAG 2.0" contrast ratio checking to avoid colors that can make hard to read the layer text. 
-version=0.10
+version=0.11
 
 homepage=https://github.com/danzig666/LayerColorPlugin
 tracker=https://github.com/danzig666/LayerColorPlugin/issues
@@ -17,6 +17,9 @@ deprecated=False
 icon=icon.png
 
 changelog=
+
+ Version 0.11:
+ * Fixes layer names being drawn on top of their symbol. The cached text position introduced in 0.10 was shared between rows with different symbol widths, so a row with a wide symbol had its name drawn up to 32 px too far left. The symbol width is now part of the cache key.
 
  Version 0.10:
  * Makes resizing the Layers panel fast again with large projects. Names are re-wrapped once when the drag stops, instead of every row being re-measured at every intermediate width.
